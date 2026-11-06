@@ -279,8 +279,10 @@ const ymd = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`
 const mkey = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}`;
 const parseD = s => { const [y,m,d] = String(s).split('-').map(Number); return new Date(y, (m||1)-1, d||1); };
 const round2 = n => Math.round(n * 100) / 100;
-const today = new Date(); today.setHours(0,0,0,0);
-const TODAY = ymd(today), THIS_MONTH = mkey(today);
+let today, TODAY, THIS_MONTH;
+function setToday(){ const d = new Date(); d.setHours(0,0,0,0); today = d; TODAY = ymd(d); THIS_MONTH = mkey(d); }
+setToday();
+const monthOf = d => String(d || '').slice(0, 7);
 const monthName = k => parseD(k + '-01').toLocaleDateString('en-PH', {month:'long', year:'numeric'});
 const monthShort = k => parseD(k + '-01').toLocaleDateString('en-PH', {month:'short'});
 const shortDate = d => (typeof d === 'string' ? parseD(d) : d).toLocaleDateString('en-PH', {month:'short', day:'numeric'});
@@ -294,6 +296,7 @@ const VIEWS = ['overview', 'units', 'bills', 'payments', 'reports'];
 const phoneQuery = window.matchMedia('(max-width: 640px)');
 
 let book = blank();
+let loadSlow = false;
 let loaded = false;
 let payMonth = THIS_MONTH, billMonth = THIS_MONTH;
 
@@ -315,6 +318,9 @@ function normalize(d){
   b.payments.forEach(o => { o.id = cid(o.id); o.stayId = cid(o.stayId); });
   b.repairs.forEach(o => { o.id = cid(o.id); o.unitId = cid(o.unitId); });
   b.readings.forEach(o => { o.id = cid(o.id); o.unitId = cid(o.unitId); });
+  // Earlier versions had no payment history start. Count unpaid months only from when the stay was
+  // first tracked, so a tenant added with an old move-in date isn't shown owing months never recorded.
+  b.stays.forEach(o => { if (o.type === 'monthly' && !/^\d{4}-\d{2}$/.test(o.trackFrom || '')) o.trackFrom = monthOf(o.start) > THIS_MONTH ? monthOf(o.start) : THIS_MONTH; });
   return b;
 }
 
@@ -344,6 +350,8 @@ async function flush(){
 }
 function useLocal(){
   local = true;
+  // Ask the browser not to clear this site's storage when the device runs low on space.
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch(e){}
   try { const raw = localStorage.getItem(KEY); if (raw && !book.units.length) book = normalize(JSON.parse(raw)); } catch(e){}
   loaded = true; setSave('Saved on this device'); render();
 }
@@ -356,7 +364,7 @@ async function start(){
   dlMode = downloads ? 'cap' : null;
   if (!db || !uid) return useLocal();
   try { ref = db.collection('data/users/' + uid).doc('book'); } catch(e){ return useLocal(); }
-  const t = setTimeout(() => { if (!loaded) setSave('Can’t reach your data yet'); }, 10000);
+  const t = setTimeout(() => { if (!loaded){ loadSlow = true; setSave('Can’t reach your data yet'); render(); } }, 10000);
   ref.onSnapshot(snap => {
     if (!snap.metadata.fromCache) clearTimeout(t);
     if (dirty || saving) return;
@@ -376,13 +384,17 @@ function isActive(s){
   return true;
 }
 const activeStay = unitId => book.stays.find(s => s.unitId === unitId && isActive(s));
+// A monthly tenant is billed for month k if they had moved in by the end of that month
+// and had not moved out before that month's due date.
 function stayActiveIn(s, k){
   if (s.type !== 'monthly') return false;
   if (s.start > monthEnd(k)) return false;
-  if (s.ended && s.ended < k + '-01') return false;
+  if (s.ended && s.ended < ymd(dueDate(s, k))) return false;
   return true;
 }
-const monthlyStayIn = (unitId, k) => book.stays.find(s => s.unitId === unitId && stayActiveIn(s, k));
+// If two tenants overlap in one month (move-out and move-in), utilities go to the newer one only.
+const monthlyStayIn = (unitId, k) => book.stays.filter(s => s.unitId === unitId && stayActiveIn(s, k))
+  .sort((a, b) => String(b.start).localeCompare(String(a.start)))[0];
 function paidFor(stay, period){
   return sum(book.payments.filter(p => p.stayId === stay.id && (stay.type === 'daily' || p.period === period)), p => p.amount);
 }
@@ -401,30 +413,55 @@ function utilOf(r){
 }
 function bill(stay, k){
   const rent = Number(stay.rent || 0);
-  const u = stay.type === 'monthly' ? utilOf(readingFor(stay.unitId, k)) : utilOf(null);
+  const ownsUtil = stay.type === 'monthly' && (monthlyStayIn(stay.unitId, k) || {}).id === stay.id;
+  const u = ownsUtil ? utilOf(readingFor(stay.unitId, k)) : utilOf(null);
   return {rent, ...u, total: round2(rent + u.elec + u.water)};
 }
 function dueDate(stay, k){
   const base = parseD(k + '-01');
   const dim = new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
-  return new Date(base.getFullYear(), base.getMonth(), Math.min(Number(stay.dueDay) || 1, dim));
+  const d = new Date(base.getFullYear(), base.getMonth(), Math.min(Number(stay.dueDay) || 1, dim));
+  // First month: rent can't be due before the tenant moves in.
+  if (stay.start && monthOf(stay.start) === k){ const st = parseD(stay.start); if (d < st) return st; }
+  return d;
+}
+// Unpaid amounts from months before this one, counted from when tracking began.
+function arrears(s){
+  const out = {total:0, months:[]};
+  if (s.type !== 'monthly') return out;
+  let k = s.trackFrom && s.trackFrom > monthOf(s.start) ? s.trackFrom : monthOf(s.start);
+  for (let guard = 0; k < THIS_MONTH && guard < 240; guard++, k = addMonths(k, 1)){
+    if (!stayActiveIn(s, k)) continue;
+    const owed = round2(bill(s, k).total - paidFor(s, k));
+    if (owed > 0.004){ out.months.push({k, owed}); out.total = round2(out.total + owed); }
+  }
+  return out;
 }
 function status(stay){
   if (stay.type === 'daily'){
-    const paid = paidFor(stay), left = Math.max(0, Number(stay.rent || 0) - paid);
-    if (left <= 0) return {key:'daily', label:`Guest until ${shortDate(stay.end)}`, left, paid};
+    const paid = paidFor(stay), left = round2(Math.max(0, Number(stay.rent || 0) - paid));
+    if (left <= 0) return {key:'daily', label: isActive(stay) ? `Guest until ${shortDate(stay.end)}` : 'Paid', left, paid};
     return {key:'over', label:`${peso(left)} unpaid`, left, paid};
   }
-  const b = bill(stay, THIS_MONTH);
-  const paid = paidFor(stay, THIS_MONTH), left = round2(Math.max(0, b.total - paid));
+  const b = bill(stay, THIS_MONTH), billedNow = stayActiveIn(stay, THIS_MONTH);
+  const paid = paidFor(stay, THIS_MONTH);
+  const leftNow = billedNow ? round2(Math.max(0, b.total - paid)) : 0;
+  const ar = arrears(stay), left = round2(leftNow + ar.total);
   const due = dueDate(stay, THIS_MONTH);
   const days = Math.round((due - today) / 86400000);
-  if (left <= 0) return {key:'paid', label:'Paid', left, paid, due, b};
+  const base = {left, leftNow, paid, due, days, b, billedNow, ar};
+  if (left <= 0) return {...base, key:'paid', label:'Paid'};
+  if (ar.total > 0) return {...base, key:'over', label:`${peso(left)} overdue`};
+  if (!billedNow) return {...base, key:'upcoming', label:'Nothing due'};
   const part = paid > 0 ? `${peso(left)} left, ` : '';
-  if (days < 0) return {key:'over', label:`${peso(left)} overdue`, left, paid, due, days, b};
-  if (days <= 5) return {key:'soon', label: part + (days === 0 ? 'due today' : `due ${shortDate(due)}`), left, paid, due, days, b};
-  return {key:'upcoming', label: part + `due ${shortDate(due)}`, left, paid, due, days, b};
+  if (days < 0) return {...base, key:'over', label:`${peso(left)} overdue`};
+  if (days <= 5) return {...base, key:'soon', label: part + (days === 0 ? 'due today' : `due ${shortDate(due)}`)};
+  if (stay.start > TODAY) return {...base, key:'upcoming', label:`Moves in ${shortDate(stay.start)}`};
+  return {...base, key:'upcoming', label: part + `due ${shortDate(due)}`};
 }
+// Former tenants and checked-out guests who still owe money.
+const pastOwing = () => book.stays.filter(s => !isActive(s) && status(s).left > 0.004);
+const unitLabel = id => (unitById(id) || {}).name || 'Removed unit';
 const first = n => String(n || '').trim().split(/\s+/)[0];
 function ordinal(n){ n = Number(n) || 1; const s = ['th','st','nd','rd'], v = n % 100; return n + (s[(v - 20) % 10] || s[v] || s[0]); }
 
@@ -442,7 +479,7 @@ function render(){
   $('#bizName').textContent = biz ? 'Paupahan' : 'Your rentals';
   document.title = biz ? `${biz} rent tracker` : 'Paupahan rent tracker';
   const app = $('#app');
-  if (!loaded){ app.innerHTML = '<p class="lede">Opening your rental book…</p>'; return; }
+  if (!loaded){ app.innerHTML = `<p class="lede">${loadSlow ? 'Can’t reach your saved data yet. Check your internet connection. This page updates by itself once it connects.' : 'Opening your rental book…'}</p>`; return; }
   app.innerHTML = ({overview, units, bills, payments, reports})[v]();
   applySearch();
 }
@@ -496,7 +533,7 @@ function overview(){
     const st = status(s);
     toCollect += st.left;
     if (st.key === 'over') overdue++;
-    if (s.type === 'monthly'){ billed += st.b.total; paidBills += Math.min(st.paid, st.b.total); }
+    if (s.type === 'monthly' && st.billedNow){ billed += st.b.total; paidBills += Math.min(st.paid, st.b.total); }
     return {u, s, st};
   });
   const pct = billed ? Math.round(paidBills / billed * 100) : 0;
@@ -510,6 +547,8 @@ function overview(){
   const tiles = groups.map(g => `<section class="grp">${heads ? grpHead(g) : ''}<div class="board">${g.units.map(u => tile(rowById.get(u.id))).join('')}</div></section>`).join('');
   const attention = rows.filter(r => r.s && (r.st.key === 'over' || r.st.key === 'soon'))
     .sort((a, b) => (a.st.key === 'over' ? 0 : 1) - (b.st.key === 'over' ? 0 : 1) || (a.st.days ?? 0) - (b.st.days ?? 0));
+  const past = pastOwing().map(s => ({s, st: status(s)}));
+  past.forEach(p => { toCollect += p.st.left; overdue++; });
   const openRepairs = book.repairs.filter(r => !r.done).length;
   const parts = [`<strong>${peso(collected)}</strong> received this month`];
   if (toCollect) parts.push(`<strong>${peso(toCollect)}</strong> still to collect`);
@@ -529,11 +568,15 @@ function overview(){
       <span style="--c:var(--over)">Overdue or unpaid</span><span style="--c:var(--daily)">Daily guest, paid</span>
       <span style="--c:var(--line)">Not due yet or vacant</span></div>
     <h3 class="group">Needs follow-up</h3>
-    ${attention.length ? `<div class="list">${attention.map(r => `
+    ${attention.length || past.length ? `<div class="list">${attention.map(r => `
       <div class="item"><div class="main"><div class="title">${esc(r.s.name)} <span class="pill ${r.st.key}">${esc(r.st.key === 'over' ? 'Overdue' : 'Due soon')}</span></div>
-      <div class="sub">${esc(r.u.name)}, ${esc(r.st.label)}</div></div>
+      <div class="sub">${esc(r.u.name)}, ${esc(r.st.label)}${r.st.ar && r.st.ar.total ? `, including ${esc(peso(r.st.ar.total))} from ${esc(r.st.ar.months.map(m => monthShort(m.k)).join(', '))}` : ''}</div></div>
       <div class="row-actions"><button class="btn small" data-act="remind" data-id="${r.s.id}">Write reminder</button>
-      <button class="btn small primary" data-act="pay" data-id="${r.s.id}">Record payment</button></div></div>`).join('')}</div>`
+      <button class="btn small primary" data-act="pay" data-id="${r.s.id}">Record payment</button></div></div>`).join('')}${past.map(p => `
+      <div class="item"><div class="main"><div class="title">${esc(p.s.name)} <span class="pill over">${p.s.type === 'daily' ? 'Checked out' : 'Moved out'}</span></div>
+      <div class="sub">${esc(unitLabel(p.s.unitId))}, ${esc(peso(p.st.left))} unpaid</div></div>
+      <div class="row-actions"><button class="btn small" data-act="remind" data-id="${p.s.id}">Write reminder</button>
+      <button class="btn small primary" data-act="pay" data-id="${p.s.id}">Record payment</button></div></div>`).join('')}</div>`
       : `<p class="lede">Nobody is overdue or due in the next 5 days.</p>`}
     ${openRepairs ? `<p class="lede" style="margin-top:14px"><a class="inline" href="#repairs">${openRepairs} open repair${openRepairs === 1 ? '' : 's'}</a> waiting to be fixed.</p>` : ''}`;
 }
@@ -612,7 +655,7 @@ function bills(){
   }).join('');
   return `<div class="section-head"><div><h2>Utility bills</h2>
       <p class="lede">${done ? `<strong>${peso(elecTotal)}</strong> electric and <strong>${peso(waterTotal)}</strong> water billed for ${esc(monthName(k))}, ${done} of ${book.units.length} units read.` : `Enter this month’s meter readings. Previous readings fill in from last month.`}</p></div>
-      <div class="month-pick"><label>Month<input type="month" id="billMonth" value="${k}"></label>
+      <div class="month-pick"><label>Month<input type="month" placeholder="YYYY-MM" id="billMonth" value="${k}"></label>
       <button class="btn" data-act="settings">Rates</button></div></div>
     ${noRates ? `<div class="callout"><span>Set your electric and water rates first so readings turn into peso amounts.</span><button class="btn small primary" data-act="settings">Set rates</button></div>`
       : `<p class="sub" style="margin:-6px 0 14px">Current rates: ${peso(book.elecRate)} per kWh, ${peso(book.waterRate)} per m³. Saved readings keep the rate they were saved with.</p>`}
@@ -625,7 +668,7 @@ function payments(){
   const by = METHODS.map(m => [m, sum(ps.filter(p => p.method === m), p => p.amount)]).filter(x => x[1]);
   return `<div class="section-head"><div><h2>Payments</h2>
       <p class="lede"><strong>${peso(total)}</strong> received in ${esc(monthName(payMonth))}${by.length ? ': ' + by.map(([m, v]) => `${esc(m)} ${peso(v)}`).join(', ') : ''}.</p></div>
-      <div class="month-pick"><label>Month<input type="month" id="payMonth" value="${payMonth}"></label>
+      <div class="month-pick"><label>Month<input type="month" placeholder="YYYY-MM" id="payMonth" value="${payMonth}"></label>
       <button class="btn primary" data-act="pay">Record payment</button></div></div>
     ${ps.length ? `<div class="list">${ps.map(p => {
       const s = stayById(p.stayId); const u = s && unitById(s.unitId);
@@ -757,7 +800,8 @@ function stayDialog(unitId){
     ${foot('Save')}</form>`, d => {
       if (d.type === 'daily' && (!d.end || d.end < d.start)){ toast('Check-out must be on or after the start date'); return false; }
       book.stays.push({id:newId(), unitId, type:d.type, name:d.name.trim(), phone:d.phone.trim(), start:d.start,
-        end: d.type === 'daily' ? d.end : '', dueDay:Number(d.dueDay) || 1, rent:Number(d.rent) || 0, deposit:Number(d.deposit) || 0});
+        end: d.type === 'daily' ? d.end : '', dueDay:Number(d.dueDay) || 1, rent:Number(d.rent) || 0, deposit:Number(d.deposit) || 0,
+        trackFrom: monthOf(d.start) > THIS_MONTH ? monthOf(d.start) : THIS_MONTH});
       commit('Saved');
     });
   const f = $('#stayForm');
@@ -769,7 +813,8 @@ function stayDialog(unitId){
 }
 
 function payDialog(stayId){
-  const active = book.units.map(u => ({u, s: activeStay(u.id)})).filter(r => r.s);
+  const active = book.units.map(u => ({u, s: activeStay(u.id)})).filter(r => r.s)
+    .concat(pastOwing().map(s => ({u:{name:unitLabel(s.unitId) + ' (left)'}, s})));
   if (!active.length){ toast('Add a tenant first'); return; }
   const pick = stayId || active[0].s.id;
   openDialog(`<form class="dlg" id="payForm"><h2>Record payment</h2>
@@ -778,7 +823,7 @@ function payDialog(stayId){
       <label>Amount (₱)<input name="amount" type="number" min="1" step="0.01" required></label>
       <label>Paid on<input name="date" type="date" required value="${TODAY}"></label>
       <label>Method<select name="method">${METHODS.map(m => `<option>${m}</option>`).join('')}</select></label>
-      <label id="periodWrap">For the month of<input name="period" type="month" value="${THIS_MONTH}"></label>
+      <label id="periodWrap">For the month of<input name="period" type="month" placeholder="YYYY-MM" value="${THIS_MONTH}"></label>
     </div>
     <p class="note" id="payNote"></p>
     <label>Reference no. (optional)<input name="ref" maxlength="40" placeholder="GCash or bank ref"></label>
@@ -787,8 +832,12 @@ function payDialog(stayId){
       commit(`${peso(d.amount)} recorded`);
     });
   const f = $('#payForm');
+  const oldest = s => { const a = status(s).ar; return a && a.months.length ? a.months[0].k : THIS_MONTH; };
+  f.stayId.addEventListener('change', () => { const s = stayById(f.stayId.value); if (s.type === 'monthly') f.period.value = oldest(s); });
+  f.period.value = oldest(stayById(f.stayId.value)) || THIS_MONTH;
   const sync = () => {
     const s = stayById(f.stayId.value);
+    if (!f.period.value) f.period.value = THIS_MONTH;
     $('#periodWrap').hidden = s.type === 'daily';
     if (s.type === 'daily'){ f.amount.value = Math.max(0, s.rent - paidFor(s)) || ''; $('#payNote').textContent = ''; return; }
     const b = bill(s, f.period.value), paid = paidFor(s, f.period.value);
@@ -796,7 +845,9 @@ function payDialog(stayId){
     const parts = [`Rent ${peso(b.rent)}`];
     if (b.elec) parts.push(`electric ${peso(b.elec)}`);
     if (b.water) parts.push(`water ${peso(b.water)}`);
-    $('#payNote').textContent = parts.join(' + ') + (paid ? `, minus ${peso(paid)} already paid` : '');
+    const ar = status(s).ar, other = ar ? round2(ar.total - (ar.months.find(m => m.k === f.period.value) || {owed:0}).owed) : 0;
+    $('#payNote').textContent = (stayActiveIn(s, f.period.value) ? parts.join(' + ') + (paid ? `, minus ${peso(paid)} already paid` : '') : 'Not billed for this month')
+      + (other > 0 ? `. Still unpaid for other months: ${peso(other)}` : '');
   };
   f.stayId.addEventListener('change', sync); f.period.addEventListener('change', sync); sync();
 }
@@ -815,6 +866,7 @@ function unitDetail(unitId){
       <dt>${s.type === 'daily' ? 'Stay' : 'Since'}</dt><dd>${esc(shortDate(s.start))}${s.type === 'daily' ? ' to ' + esc(shortDate(s.end)) : ''}</dd>
       ${b ? `<dt>This month</dt><dd>Rent ${peso(b.rent)}${b.elec ? `<br>Electric ${peso(b.elec)} (${b.kwh} kWh)` : ''}${b.water ? `<br>Water ${peso(b.water)} (${b.m3} m³)` : ''}<br>Total ${peso(b.total)}, due ${esc(shortDate(st.due))}</dd>`
           : `<dt>Total</dt><dd>${peso(s.rent)}</dd>`}
+      ${st.ar && st.ar.total ? `<dt>Earlier months</dt><dd>${st.ar.months.map(m => `${esc(monthShort(m.k))}: ${peso(m.owed)} unpaid`).join('<br>')}</dd>` : ''}
       ${s.deposit ? `<dt>Deposit held</dt><dd>${peso(s.deposit)}</dd>` : ''}
       <dt>Last payments</dt><dd>${recent.length ? recent.map(p => `${peso(p.amount)} on ${esc(shortDate(p.date))}`).join('<br>') : 'None yet'}</dd>
     </dl>
@@ -826,21 +878,36 @@ function unitDetail(unitId){
 }
 
 function reminderText(s, lang){
-  const u = unitById(s.unitId), st = status(s), f = first(s.name), tl = lang === 'tl';
+  const u = {name: unitLabel(s.unitId)}, st = status(s), f = first(s.name), tl = lang === 'tl';
   const biz = book.business || (tl ? 'ang may-ari' : 'your landlord');
   const pay = tl ? 'Puwede pong magbayad via GCash, Maya, bank transfer, o cash.' : 'You can pay via GCash, Maya, bank transfer, or cash.';
+  const ref = tl ? 'Pakisend na lang po ang reference number pagkabayad.' : 'Please send your reference number once paid.';
   const thanks = `Salamat po! (${biz})`;
-  if (s.type === 'daily') return tl
+  // Daily guests and anyone who has already left: one simple balance message.
+  if (s.type === 'daily' || !isActive(s)) return tl
     ? `Hi ${f}! Paalala lang po na may natitira pang balance na ${peso(st.left)} para sa stay ninyo sa ${u.name}. ${pay} ${thanks}`
     : `Hi ${f}! Friendly reminder that there’s a remaining balance of ${peso(st.left)} for your stay at ${u.name}. ${pay} ${thanks}`;
+  const mo = monthName(THIS_MONTH), due = shortDate(st.due);
+  // Case 1: unpaid earlier months.
+  if (st.ar.total){
+    const from = st.ar.months.map(m => monthShort(m.k)).join(', ');
+    if (!st.leftNow) return tl
+      ? `Hi ${f}! Paalala lang po na may hindi pa nababayarang ${peso(st.ar.total)} para sa ${u.name} mula ${from}. ${pay} ${ref} ${thanks}`
+      : `Hi ${f}! Friendly reminder that ${peso(st.ar.total)} for ${u.name} is still unpaid from ${from}. ${pay} ${ref} ${thanks}`;
+    const now = st.days < 0 ? (tl ? `lagpas na sa due date (${due})` : `was due on ${due}`) : (tl ? `due sa ${due}` : `is due on ${due}`);
+    return tl
+      ? `Hi ${f}! Paalala lang po na may hindi pa nababayarang ${peso(st.ar.total)} para sa ${u.name} mula ${from}, at ang bayad para sa ${mo} na ${peso(st.leftNow)} ay ${now}. Kabuuang balance: ${peso(st.left)}. ${pay} ${ref} ${thanks}`
+      : `Hi ${f}! Friendly reminder that ${peso(st.ar.total)} for ${u.name} is still unpaid from ${from}, and your ${mo} bill of ${peso(st.leftNow)} ${now}. Total balance: ${peso(st.left)}. ${pay} ${ref} ${thanks}`;
+  }
   const b = st.b, parts = [tl ? `upa ${peso(b.rent)}` : `rent ${peso(b.rent)}`];
   if (b.elec) parts.push(tl ? `kuryente ${peso(b.elec)} (${b.kwh} kWh)` : `electricity ${peso(b.elec)} (${b.kwh} kWh)`);
   if (b.water) parts.push(tl ? `tubig ${peso(b.water)} (${b.m3} m³)` : `water ${peso(b.water)} (${b.m3} m³)`);
   const bd = parts.length > 1 && !st.paid ? (tl ? ` Kasama na po rito ang ${parts.join(', ')}.` : ` This covers ${parts.join(', ')}.`) : '';
-  const mo = monthName(THIS_MONTH), due = shortDate(st.due);
-  if (st.key === 'over') return tl
-    ? `Hi ${f}! Paalala lang po na lagpas na sa due date (${due}) ang bayad para sa ${u.name} (${mo}). Natitirang balance: ${peso(st.left)}.${bd} ${pay} Pakisend na lang po ang reference number pagkabayad. ${thanks}`
-    : `Hi ${f}! Friendly reminder that your bill for ${u.name} (${mo}) was due on ${due}. Remaining balance: ${peso(st.left)}.${bd} ${pay} Please send your reference number once paid. ${thanks}`;
+  // Case 2: this month's bill is past due.
+  if (st.days < 0) return tl
+    ? `Hi ${f}! Paalala lang po na lagpas na sa due date (${due}) ang bayad para sa ${u.name} (${mo}). Natitirang balance: ${peso(st.left)}.${bd} ${pay} ${ref} ${thanks}`
+    : `Hi ${f}! Friendly reminder that your bill for ${u.name} (${mo}) was due on ${due}. Remaining balance: ${peso(st.left)}.${bd} ${pay} ${ref} ${thanks}`;
+  // Case 3: coming due.
   return tl
     ? `Hi ${f}! Paalala lang po na ang bayad para sa ${u.name} (${mo}) na ${peso(st.left)} ay due sa ${due}.${bd} ${pay} ${thanks}`
     : `Hi ${f}! Just a heads up that your bill for ${u.name} (${mo}) of ${peso(st.left)} is due on ${due}.${bd} ${pay} ${thanks}`;
@@ -1091,6 +1158,11 @@ function toDate(v){
   m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})$/); if (m) return `${m[3].length === 2 ? '20' + m[3] : m[3]}-${pad(m[1])}-${pad(m[2])}`;
   const t = Date.parse(s); return isNaN(t) ? '' : ymd(new Date(t));
 }
+function fixPhone(v){
+  if (typeof v !== 'number') return String(v ?? '').trim();
+  const d = String(Math.round(v));
+  return /^9\d{9}$/.test(d) ? '0' + d : /^639\d{9}$/.test(d) ? '+' + d : d;
+}
 function parseRow(r){
   const unit = String(cell(r, 'unit')).trim(); if (!unit) return null;
   const name = String(cell(r, 'name')).trim();
@@ -1103,7 +1175,7 @@ function parseRow(r){
   if (dv instanceof Date || (typeof dv === 'number' && dv > 31)){ const d = toDate(dv); dueDay = d ? parseD(d).getDate() : NaN; }
   else dueDay = parseInt(String(dv).replace(/[^0-9]/g, ''), 10);
   if (!(dueDay >= 1 && dueDay <= 31)) dueDay = parseD(start).getDate();
-  return {unit, name, rent, start, endRaw, end: type === 'daily' ? (endRaw || start) : '', type, dueDay, phone: String(cell(r, 'phone')).trim(), group: String(cell(r, 'group')).trim()};
+  return {unit, name, rent, start, endRaw, end: type === 'daily' ? (endRaw || start) : '', type, dueDay, phone: fixPhone(cell(r, 'phone')), group: String(cell(r, 'group')).trim()};
 }
 function runImport(){
   if (!imp || !imp.rows){ toast('Choose a file first'); return false; }
@@ -1117,7 +1189,8 @@ function runImport(){
     else if (!u.group && r.group) u.group = r.group;
     else if (!u.rate && r.type === 'monthly' && r.rent) u.rate = r.rent;
     if (!r.name) return;
-    const s = {id:newId(), unitId:u.id, type:r.type, name:r.name, phone:r.phone, start:r.start, end:r.end, dueDay:r.dueDay, rent:r.rent, deposit:0};
+    const s = {id:newId(), unitId:u.id, type:r.type, name:r.name, phone:r.phone, start:r.start, end:r.end, dueDay:r.dueDay, rent:r.rent, deposit:0,
+      trackFrom: monthOf(r.start) > THIS_MONTH ? monthOf(r.start) : THIS_MONTH};
     if (r.type === 'monthly' && r.endRaw && r.endRaw < TODAY) s.ended = r.endRaw;
     const dup = book.stays.some(x => x.unitId === u.id && x.name.toLowerCase() === s.name.toLowerCase() && x.start === s.start);
     if (dup || (isActive(s) && activeStay(u.id))){ skip++; return; }
@@ -1144,7 +1217,7 @@ function loadSample(){
       e += de; w += dw;
     });
     if (!n) return;
-    const s = {id:newId(), unitId:u.id, type:'monthly', name:n[0], phone:'0917 555 01' + pad(i), start:startK + '-01', end:'', dueDay:n[2], rent:n[1], deposit:n[1] * 2};
+    const s = {id:newId(), unitId:u.id, type:'monthly', name:n[0], phone:'0917 555 01' + pad(i), start:startK + '-01', end:'', dueDay:n[2], rent:n[1], deposit:n[1] * 2, trackFrom:startK};
     book.stays.push(s);
     months.forEach(k => {
       const total = bill(s, k).total;
@@ -1280,6 +1353,16 @@ themeBtn.addEventListener('click', () => {
 if (darkQuery.addEventListener) darkQuery.addEventListener('change', syncThemeBtn);
 if (phoneQuery.addEventListener) phoneQuery.addEventListener('change', () => { if (currentView() === 'reports') render(); });
 syncThemeBtn();
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  const oldDay = TODAY, oldMonth = THIS_MONTH;
+  setToday();
+  if (TODAY === oldDay) return;
+  if (payMonth === oldMonth) payMonth = THIS_MONTH;
+  if (billMonth === oldMonth) billMonth = THIS_MONTH;
+  render();
+});
 
 start();
 })();
