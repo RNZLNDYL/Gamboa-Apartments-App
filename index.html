@@ -5,9 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Paupahan rent tracker</title>
 <script>try{var t=localStorage.getItem('paupahan-theme');if(t==='dark'||t==='light')document.documentElement.dataset.theme=t;}catch(e){}</script>
+<link rel="preconnect" href="https://www.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://firestore.googleapis.com" crossorigin>
+<link rel="modulepreload" href="https://www.gstatic.com/firebasejs/12.16.0/firebase-app.js">
+<link rel="modulepreload" href="https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js">
+<link rel="modulepreload" href="https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,750&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- Fonts load without blocking the first paint: the page shows system fonts at once, then swaps. -->
+<link id="fontcss" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,750&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" media="print">
+<script>(function(){var l=document.getElementById('fontcss');function on(){l.media='all';}if(l.sheet)on();else l.addEventListener('load',on);})();</script>
 <style>
 :root{
   --bg:#F3F6F4; --surface:#FFFFFF; --ink:#19353F; --muted:#557079; --line:#D5E0DD;
@@ -146,6 +153,11 @@ textarea{resize:vertical}
 label.filebtn{display:inline-flex;flex-direction:row;align-items:center;color:var(--ink);font-size:.85rem;cursor:pointer;position:relative}
 label.filebtn:focus-within{outline:3px solid var(--focus);outline-offset:2px}
 .vh{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0)}
+details.example{border:1px solid var(--line);border-radius:12px;padding:10px 14px;min-width:0}
+details.example .scroll{margin:4px 0 8px}
+details.example summary{cursor:pointer;font-weight:700;color:var(--ink)}
+details.example[open] summary{margin-bottom:8px}
+details.example .note{margin:4px 0}
 .danger-zone{border:1px solid var(--over);border-radius:12px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px}
 .danger-zone .title{color:var(--over)}
 .month-pick{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
@@ -300,7 +312,6 @@ window.FB = { app, db, auth, GoogleAuthProvider, signInWithPopup, signInWithRedi
   doc, collection, onSnapshot, getDoc, setDoc, deleteDoc, writeBatch, serverTimestamp, terminate, clearIndexedDbPersistence };
 window.dispatchEvent(new Event('fb-ready'));
 </script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script>
 (function(){
 const $ = s => document.querySelector(s);
@@ -439,6 +450,52 @@ document.addEventListener('focusout', e => {
   setTimeout(() => { const a = document.activeElement; if (!(a && $('#app').contains(a) && a.matches('input,select,textarea'))){ pendingRender = false; render(); } }, 0);
 });
 
+/* Session memory: which business and role this person had last time. It only decides what to start
+   loading. The member listener still confirms with the server, and the security rules still decide
+   what can actually be read. A wrong guess just triggers a recheck. */
+const SESSION_KEY = 'paupahan-session';
+function readSession(uid){
+  try { const x = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+    return x && x.uid === uid && SAFE_ID.test(x.bizId || '') && ROLE_NAMES[x.role] ? x : null; } catch(e){ return null; }
+}
+function writeSession(){ try { if (fbUser && bizId && role) localStorage.setItem(SESSION_KEY, JSON.stringify({uid:fbUser.uid, bizId, role})); } catch(e){} }
+function clearSession(){ try { localStorage.removeItem(SESSION_KEY); localStorage.removeItem(CACHE_KEY); } catch(e){} }
+/* Last-view preview: a copy of what this person last saw, shown instantly on reopen while Firebase
+   loads. Buttons stay paused until live data arrives, so nothing is edited from a stale copy. It holds
+   only what this person's role could already see, and signing out erases it. */
+const CACHE_KEY = 'paupahan-cache';
+let previewMode = false, previewBook = null, previewRole = '', previewUid = '', cacheTimer = null;
+function saveCacheNow(){
+  clearTimeout(cacheTimer);
+  try { if (loaded && !gate && !previewMode && fbUser && bizId && role) localStorage.setItem(CACHE_KEY, JSON.stringify({uid:fbUser.uid, bizId, role, book})); } catch(e){}
+}
+function saveCache(){ clearTimeout(cacheTimer); cacheTimer = setTimeout(saveCacheNow, 800); }
+// Phones often close or switch apps right after a glance, before the timer fires, so also save then.
+window.addEventListener('pagehide', saveCacheNow);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveCacheNow(); });
+function loadPreview(){
+  try {
+    const c = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null');
+    if (!c || !c.book || !ROLE_NAMES[c.role] || !SAFE_ID.test(c.bizId || '')) return;
+    previewBook = normalize(c.book); previewRole = c.role; previewUid = String(c.uid || ''); previewMode = true;
+    document.body.classList.toggle('maint', previewRole === 'maintenance');
+    setSave('Updating…');
+  } catch(e){}
+}
+function endPreview(){ previewMode = false; previewBook = null; }
+let rechecking = false;
+async function recheckRole(){
+  if (rechecking) return; rechecking = true;
+  try {
+    const ms = await FB.getDoc(FB.doc(FB.db, 'businesses', bizId, 'members', fbUser.uid));
+    if (!ms.exists()){ clearSession(); stopSync(); gate = 'removed'; render(); return; }
+    const r = ms.data().role;
+    if (r !== role && ROLE_NAMES[r]){ role = r; document.body.classList.toggle('maint', role === 'maintenance'); writeSession(); subscribeData(); render(); }
+    else syncError({code:'denied-after-recheck'});
+  } catch(e){ syncError(e); }
+  finally { rechecking = false; }
+}
+
 function cleanIn(col, id, data){
   if (!SAFE_ID.test(id)) return null;
   const o = {...data, id};
@@ -448,14 +505,14 @@ function cleanIn(col, id, data){
 }
 function markReady(k){
   ready.add(k);
-  if (!loaded && [...need].every(x => ready.has(x))){ loaded = true; gate = ''; showSaveState(); render(); }
+  if (!loaded && [...need].every(x => ready.has(x))){ loaded = true; gate = ''; endPreview(); showSaveState(); render(); }
 }
 function stopTeam(){ teamUnsubs.forEach(u => { try { u(); } catch(e){} }); teamUnsubs = []; team = {members:[], invites:[]}; }
 function stopData(){ dataUnsubs.forEach(u => { try { u(); } catch(e){} }); dataUnsubs = []; stopTeam(); }
 function stopSync(){ unsubs.forEach(u => { try { u(); } catch(e){} }); unsubs = []; stopData(); }
 
 function syncError(e){
-  if (e && e.code === 'permission-denied'){ stopSync(); gate = 'removed'; render(); return; }
+  if (e && e.code === 'permission-denied'){ clearSession(); stopSync(); gate = 'removed'; render(); return; }
   stopSync(); gate = 'error'; gateMsg = 'Lost the connection to your records. Check your internet, then tap Try again.'; render();
 }
 
@@ -476,7 +533,10 @@ function subscribeData(){
       });
       markReady(col);
       if (loaded) scheduleRender();
-    }, e => { if (colsFor(role).includes(col)) syncError(e); }));
+    }, e => {
+      if (!colsFor(role).includes(col)) return;
+      if (e && e.code === 'permission-denied') recheckRole(); else syncError(e);
+    }));
   });
   if (role === 'owner'){
     teamUnsubs.push(FB.onSnapshot(FB.collection(FB.db, 'businesses', bizId, 'members'), snap => {
@@ -488,14 +548,16 @@ function subscribeData(){
   }
 }
 
-function startSync(){
+function startSync(knownRole){
   stopSync();
   book = blank(); role = ''; syncedBiz = ''; loaded = false; gate = 'boot';
   SYNC_COLS.forEach(c => synced[c] = new Map());
   need = new Set(['me', 'biz']); ready = new Set();
   render();
+  // Returning user: start loading their data right away instead of waiting for the membership check.
+  if (knownRole){ role = knownRole; document.body.classList.toggle('maint', role === 'maintenance'); subscribeData(); }
   unsubs.push(FB.onSnapshot(FB.doc(FB.db, 'businesses', bizId, 'members', fbUser.uid), snap => {
-    if (!snap.exists()){ stopSync(); gate = 'removed'; render(); return; }
+    if (!snap.exists()){ clearSession(); stopSync(); gate = 'removed'; render(); return; }
     const r = snap.data().role;
     if (!ROLE_NAMES[r]){ syncError({code:'permission-denied'}); return; }
     if (r !== role){
@@ -504,6 +566,7 @@ function startSync(){
       subscribeData();
       if (loaded){ toast(`Your role is now ${ROLE_NAMES[role]}`); render(); }
     }
+    writeSession();
     markReady('me');
   }, syncError));
   unsubs.push(FB.onSnapshot(FB.doc(FB.db, 'businesses', bizId), snap => {
@@ -593,6 +656,7 @@ async function signIn(){
 }
 // Signing out also erases this phone's offline copy, so the next person using the device can't see the records.
 async function signOutAll(){
+  clearSession();
   stopSync();
   try { await FB.signOut(FB.auth); } catch(e){}
   try { await FB.terminate(FB.db); await FB.clearIndexedDbPersistence(FB.db); } catch(e){}
@@ -607,14 +671,17 @@ function waitForFirebase(){
   });
 }
 async function start(){
+  loadPreview();
   render();
   try { FB = await waitForFirebase(); }
   catch(e){ gate = 'error'; gateMsg = 'Couldn’t load the app. Check your internet connection, then reload the page.'; render(); return; }
   FB.getRedirectResult(FB.auth).catch(e => { gateMsg = authError(e); if (gate === 'signin') render(); });
   FB.onAuthStateChanged(FB.auth, user => {
     fbUser = user;
-    if (!user){ stopSync(); bizId = ''; role = ''; gate = 'signin'; render(); return; }
-    enterAs(user);
+    if (!user){ endPreview(); clearSession(); stopSync(); bizId = ''; role = ''; gate = 'signin'; render(); return; }
+    if (previewMode && previewUid !== user.uid) endPreview();
+    const sess = readSession(user.uid);
+    if (sess){ bizId = sess.bizId; startSync(sess.role); } else enterAs(user);
   });
 }
 
@@ -762,6 +829,17 @@ function currentView(){
   return VIEWS.includes(h) ? h : 'overview';
 }
 function render(){
+  if (gate && gate !== 'boot') endPreview();
+  if (previewMode && previewBook && !loaded){
+    const keep = {book, role, gate, loaded};
+    book = previewBook; role = previewRole; gate = ''; loaded = true;
+    try { draw(); } finally { book = keep.book; role = keep.role; gate = keep.gate; loaded = keep.loaded; }
+    return;
+  }
+  draw();
+  if (loaded && !gate) saveCache();
+}
+function draw(){
   const v = currentView();
   document.querySelectorAll('.tabs a').forEach(a => { if (a.getAttribute('href') === '#' + v) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
   const biz = (book.business || '').trim();
@@ -1318,7 +1396,7 @@ async function saveFile(filename, data, mime){
 }
 
 async function exportExcel(){
-  if (!window.XLSX){ toast('The Excel tool didn’t load. Check your connection and try again'); return; }
+  if (!(await needXLSX())) return;
   const unitName = id => (unitById(id) || {}).name || 'Removed unit';
   const byUnit = (a, b) => a.localeCompare(b, undefined, {numeric:true});
   const H_UNITS = ['Unit', 'Usual monthly rent (PHP)', 'Tenant or guest', 'Type', 'Phone', 'Start', 'End or moved out', 'Due day', 'Rent or stay total (PHP)', 'Deposit held (PHP)', 'Status'];
@@ -1426,6 +1504,28 @@ function saveReading(form){
   commit(`${unitById(unitId).name} readings saved`);
 }
 
+/* ---------- Excel tool, loaded only when needed ----------
+   It's 861 KB, the largest download in the app, and only Import and Export use it.
+   Loading it on demand keeps it from delaying every app open. */
+let xlsxPromise = null;
+function loadXLSX(){
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (!xlsxPromise) xlsxPromise = new Promise((res, rej) => {
+    const sc = document.createElement('script');
+    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    sc.onload = () => window.XLSX ? res(window.XLSX) : rej(new Error('missing'));
+    sc.onerror = () => { xlsxPromise = null; rej(new Error('load failed')); };
+    document.head.appendChild(sc);
+  });
+  return xlsxPromise;
+}
+async function needXLSX(){
+  if (window.XLSX) return true;
+  toast('Loading the Excel tool…');
+  try { await loadXLSX(); return true; }
+  catch(e){ toast('The Excel tool didn’t load. Check your connection and try again'); return false; }
+}
+
 /* ---------- Excel / CSV import ---------- */
 const FIELDS = [
   ['unit', 'Unit or room', /unit|room|kwarto|apt|apartment|door/i, true],
@@ -1439,10 +1539,43 @@ const FIELDS = [
   ['end', 'End or check-out date', /end|check.?out|until|depart/i],
 ];
 let imp = null;
-function importDialog(){
-  if (!window.XLSX){ toast('The Excel reader didn’t load. Check your connection and try again'); return; }
+// The example uses column names the importer recognizes on its own, so a file copied from it needs no matching.
+const EXAMPLE_HEAD = ['Unit', 'Building', 'Tenant', 'Phone', 'Type', 'Rent', 'Due day', 'Start date', 'End date'];
+function exampleRows(){
+  const at = n => { const d = new Date(today); d.setDate(d.getDate() + n); d.setHours(12); return d; };
+  return [
+    ['Unit 1', 'Old building', 'Maria Santos', '0917 123 4567', 'Monthly', 5500, 5, new Date(today.getFullYear(), 0, 15, 12), ''],
+    ['Unit 2', 'Old building', '', '', '', 5000, '', '', ''],
+    ['B1', 'New building', 'Ana Cruz', '0918 555 0000', 'Daily', 2400, '', at(0), at(2)],
+  ];
+}
+async function downloadTemplate(){
+  if (!(await needXLSX())) return;
+  const ws = XLSX.utils.aoa_to_sheet([EXAMPLE_HEAD, ...exampleRows()]);
+  ws['!cols'] = EXAMPLE_HEAD.map(h => ({wch: Math.max(h.length + 2, 14)}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Units and tenants');
+  const buf = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+  if (await saveFile('paupahan-import-example.xlsx', buf, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'))
+    toast('Example saved. Replace the sample rows with your own, then import it');
+}
+function exampleBox(){
+  const cell = v => v instanceof Date ? esc(ymd(v)) : v === '' ? '<span class="sub">blank</span>' : esc(v);
+  return `<details class="example" open><summary>What your file should look like</summary>
+    <div class="scroll"><table class="prev"><thead><tr>${EXAMPLE_HEAD.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead>
+      <tbody>${exampleRows().map(r => `<tr>${r.map(v => `<td>${cell(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+    <p class="note"><strong>Row 1 must be the column names.</strong> Only <strong>Unit</strong> is required. Leave Tenant blank for a vacant unit, like Unit 2.</p>
+    <p class="note"><strong>Type:</strong> Monthly or Daily. <strong>Rent:</strong> the monthly rent, or the total for a daily stay. <strong>Due day:</strong> 1 to 31. <strong>Dates:</strong> Excel dates, 2026-11-07, or 11/07/2026 (month first). <strong>Phone:</strong> format the column as Text in Excel so the leading 0 stays.</p>
+    <p class="note">Other names work too, like Kwarto, Pangalan, Upa, Contact, Move-in, or Check-out. You can also match columns yourself after choosing a file.</p>
+    <div><button type="button" class="btn small" data-act="import-template">Download example file</button></div>
+  </details>`;
+}
+
+async function importDialog(){
+  if (!(await needXLSX())) return;
   imp = null;
   openDialog(`<form class="dlg" id="impForm"><h2>Import from Excel</h2>
+    ${exampleBox()}
     <p class="note">Choose your bookings file (.xlsx, .xls, or .csv). You’ll match its columns and see a preview before anything is added.</p>
     <label>File<input type="file" id="impFile" accept=".xlsx,.xls,.csv"></label>
     <div id="impStep"></div>
@@ -1451,8 +1584,9 @@ function importDialog(){
     const f = e.target.files[0]; if (!f) return;
     try {
       const buf = await f.arrayBuffer();
-      const wb = XLSX.read(buf, {type:'array', cellDates:true});
+      const wb = XLSX.read(buf, {type:'array'});  // dates stay as Excel day numbers; toDate() converts them exactly
       imp = {wb, sheet: wb.SheetNames[0]};
+      const ex = dlg.querySelector('details.example'); if (ex) ex.open = false;
       loadSheet();
     } catch(err){ $('#impStep').innerHTML = '<p class="note">That file couldn’t be read. Save it as .xlsx or .csv and try again.</p>'; }
   });
@@ -1486,8 +1620,10 @@ function drawStep(){
 function cell(r, k){ const i = imp.map[k]; return i === undefined ? '' : r[i]; }
 function toDate(v){
   if (v === '' || v == null) return '';
-  if (v instanceof Date) return isNaN(v) ? '' : ymd(new Date(v.getTime() + 43200000));
-  if (typeof v === 'number' && v > 20000 && v < 80000){ const d = new Date(Math.round((v - 25569) * 86400000)); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`; }
+  if (v instanceof Date) return isNaN(v) ? '' : ymd(v);
+  // Excel dates are day counts; the fraction is the time of day. Math.floor drops the time,
+  // so 3pm on Jan 15 is still Jan 15. 25569 is the day count for 1970-01-01.
+  if (typeof v === 'number' && v > 20000 && v < 80000){ const d = new Date((Math.floor(v) - 25569) * 86400000); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`; }
   const s = String(v).trim();
   let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if (m) return `${m[1]}-${pad(m[2])}-${pad(m[3])}`;
   m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})$/); if (m) return `${m[3].length === 2 ? '20' + m[3] : m[3]}-${pad(m[1])}-${pad(m[2])}`;
@@ -1587,6 +1723,7 @@ function loadSample(){
 /* ---------- events ---------- */
 document.addEventListener('click', e => {
   const b = e.target.closest('[data-act]'); if (!b) return;
+  if (previewMode && !loaded && b.dataset.act !== 'close'){ toast('Updating to the latest data, one moment…'); return; }
   const id = b.dataset.id, act = b.dataset.act;
   const wasOpen = dlg.open;
   const go = fn => { if (wasOpen) closeDialog(); fn(); };
@@ -1613,6 +1750,7 @@ document.addEventListener('click', e => {
       if (!confirm(`Remove ${m.email}? They will immediately lose access on every device.`)) break;
       FB.deleteDoc(FB.doc(FB.db, 'businesses', bizId, 'members', id)).catch(() => toast('Couldn’t remove them. Check your connection')); break; }
     case 'import': go(importDialog); break;
+    case 'import-template': downloadTemplate(); break;
     case 'copy': {
       const t = $('#remText'); t.select();
       const done = () => toast('Copied. Paste it into Messenger or SMS');
@@ -1644,6 +1782,7 @@ document.addEventListener('change', e => {
   if (e.target.id === 'restoreFile'){ const f = e.target.files[0]; closeDialog(); restoreFrom(f); }
 });
 document.addEventListener('submit', e => {
+  if (previewMode && !loaded){ e.preventDefault(); toast('Updating to the latest data, one moment…'); return; }
   if (e.target.id === 'createBizForm'){
     e.preventDefault();
     const name = String(new FormData(e.target).get('name') || '').trim();
